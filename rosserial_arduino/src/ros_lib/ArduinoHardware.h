@@ -1,4 +1,4 @@
-/* 
+/*
  * Software License Agreement (BSD License)
  *
  * Copyright (c) 2011, Willow Garage, Inc.
@@ -62,12 +62,17 @@
   #define SERIAL_CLASS HardwareSerial
 #endif
 
+// Maidbot modified: buffer failed writes
+#define FAIL_BUFFER_SIZE  20000
+
 class ArduinoHardware {
   public:
-    ArduinoHardware(SERIAL_CLASS* io , long baud= 57600){
+    ArduinoHardware(SERIAL_CLASS* io , long baud= 57600)
+    {
       iostream = io;
       baud_ = baud;
     }
+
     ArduinoHardware()
     {
 #if defined(USBCON) and !(defined(USE_USBCON))
@@ -84,32 +89,85 @@ class ArduinoHardware {
       this->iostream = h.iostream;
       this->baud_ = h.baud_;
     }
-  
-    void setBaud(long baud){
+
+    void setBaud(long baud)
+    {
       this->baud_= baud;
     }
-  
-    int getBaud(){return baud_;}
 
-    void init(){
-#if defined(USE_USBCON)
-      // Startup delay as a fail-safe to upload a new sketch
-      delay(3000); 
-#endif
+    int getBaud()
+    {
+      return baud_;
+    }
+
+    void init()
+    {
+      // Maidbot modified: no startup delay
       iostream->begin(baud_);
+      fail_buffer_len = 0;
     }
 
-    int read(){return iostream->read();};
-    void write(uint8_t* data, int length){
-      for(int i=0; i<length; i++)
-        iostream->write(data[i]);
+    int read()
+    {
+      // Maidbot modified: add indentation
+      return iostream->read();
     }
 
-    unsigned long time(){return millis();}
+    // Maidbot modified: buffer failed writes
+    void write(uint8_t* data, int length)
+    {
+      // If we have failed sends already...
+      if (fail_buffer_len > 0)
+      {
+        // Try to send failed data first
+        int written = iostream->write(fail_buffer, fail_buffer_len);
+
+        // If that fails, add current data to the fail buffer
+        if (written == -1)
+        {
+          if (fail_buffer_len + length < FAIL_BUFFER_SIZE)
+          {
+            memcpy(&fail_buffer[fail_buffer_len], data, length);
+            fail_buffer_len += length;
+          }
+        }
+
+        // If that succeeds, send current data as well
+        else
+        {
+          iostream->write(data, length);
+          fail_buffer_len = 0;
+        }
+      }
+
+      // If we have not failed recently...
+      else
+      {
+        int written = iostream->write(data, length);
+
+        if (written == -1)
+        {
+          if (length < FAIL_BUFFER_SIZE)
+          {
+            memcpy(fail_buffer, data, length);
+            fail_buffer_len = length;
+          }
+        }
+      }
+    }
+
+    unsigned long time()
+    {
+      return millis();
+    }
 
   protected:
     SERIAL_CLASS* iostream;
     long baud_;
+
+    // Maidbot modified: buffer failed writes
+    uint8_t fail_buffer[FAIL_BUFFER_SIZE];
+    uint16_t fail_buffer_len = 0;
 };
 
 #endif

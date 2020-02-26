@@ -89,6 +89,77 @@ def load_service(package,service):
     mres = getattr(s, service+"Response")
     return srv,mreq,mres
 
+class TcpClient(object):
+    """ Simplify socket interaction for rosserial """
+
+    def __init__(self, host, port):
+        self._connected = False
+
+        self._host = host
+        self._port = port
+        self._check_connection()
+
+    def _check_connection(self):
+        if not self._connected:
+            try:
+                self._s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._s.connect((self._host, self._port))
+                self._connected = True
+                return True
+            except socket.error:
+                self._connected = False
+                return False
+        else:
+            return True
+
+    def flushInput(self):
+        self.read(self.inWaiting())
+
+    def write(self, data):
+        if not self._check_connection():
+            return
+
+        try:
+            self._s.sendall(data)
+        except socket.error:
+            self._connected = False
+
+    def read(self, count):
+        if not self._check_connection():
+            return ''
+
+        if count <= 0:
+            return ''
+
+        data = ''
+        while len(data) < count:
+            try:
+                chunk = self._s.recv(count - len(data))
+                data += chunk
+                if chunk == '':
+                    self._connected = False
+                    return data
+
+            except socket.error:
+                self._connected = False
+                return ''
+
+        return data
+
+    def inWaiting(self):
+        if not self._check_connection():
+            return 0
+
+        try:
+            read = self._s.recv(4096, socket.MSG_DONTWAIT | socket.MSG_PEEK)
+            if read == '':
+                self._connected = False
+
+            return len(read)
+        except socket.error:
+            return 0
+
+
 class Publisher:
     """
         Publisher forwards messages from the serial device to ROS.
@@ -134,7 +205,10 @@ class Subscriber:
         """ Forward message to serial device. """
         data_buffer = StringIO.StringIO()
         msg.serialize(data_buffer)
-        self.parent.send(self.id, data_buffer.getvalue())
+        try:
+            self.parent.send(self.id, data_buffer.getvalue())
+        except SerialException as e:
+            rospy.logwarn_throttle(5, "Send failed. Port might be missing {0}".format(e.what()))
 
     def unregister(self):
         rospy.loginfo("Removing subscriber: %s", self.topic)
@@ -339,7 +413,11 @@ class SerialClient(object):
         self.synced = False
         self.fix_pyserial_for_test = fix_pyserial_for_test
 
+        self.topics = dict()
+
         self.pub_diagnostics = rospy.Publisher('/diagnostics', diagnostic_msgs.msg.DiagnosticArray, queue_size=10)
+        self.port_name = port
+        self.baud = baud
 
         if port is None:
             # no port specified, listen for any new port?
@@ -378,18 +456,30 @@ class SerialClient(object):
 
         self.buffer_out = -1
         self.buffer_in = -1
+        self.resetCallbacks()
 
+        # rospy.sleep(2.0) # TODO
+        self.requestTopics()
+
+        self.lastsync = rospy.Time.now()
+        self.lastqueuecheck = rospy.Time.now()
+        signal.signal(signal.SIGINT, self.txStopRequest)
+
+    def resetCallbacks(self):
         self.callbacks = dict()
         # endpoints for creating new pubs/subs
         self.callbacks[TopicInfo.ID_PUBLISHER] = self.setupPublisher
         self.callbacks[TopicInfo.ID_SUBSCRIBER] = self.setupSubscriber
+
         # service client/servers have 2 creation endpoints (a publisher and a subscriber)
         self.callbacks[TopicInfo.ID_SERVICE_SERVER+TopicInfo.ID_PUBLISHER] = self.setupServiceServerPublisher
         self.callbacks[TopicInfo.ID_SERVICE_SERVER+TopicInfo.ID_SUBSCRIBER] = self.setupServiceServerSubscriber
         self.callbacks[TopicInfo.ID_SERVICE_CLIENT+TopicInfo.ID_PUBLISHER] = self.setupServiceClientPublisher
         self.callbacks[TopicInfo.ID_SERVICE_CLIENT+TopicInfo.ID_SUBSCRIBER] = self.setupServiceClientSubscriber
+
         # custom endpoints
         self.callbacks[TopicInfo.ID_PARAMETER_REQUEST] = self.handleParameterRequest
+        self.callbacks[TopicInfo.ID_PARAMETER_PUSH] = self.handleParameterSetRequest
         self.callbacks[TopicInfo.ID_LOG] = self.handleLoggingRequest
         self.callbacks[TopicInfo.ID_TIME] = self.handleTimeRequest
 
@@ -509,7 +599,7 @@ class SerialClient(object):
                 # Validate message length checksum.
                 if msg_len_checksum % 256 != 255:
                     rospy.loginfo("wrong checksum for msg length, length %d" %(msg_length))
-                    rospy.loginfo("chk is %d" % ord(msg_len_chk))
+                    rospy.logdebug("chk is %d", ord(msg_len_chk))
                     continue
 
                 # Read topic id (2 bytes)
@@ -543,7 +633,7 @@ class SerialClient(object):
                         self.requestTopics()
                     rospy.sleep(0.001)
                 else:
-                    rospy.loginfo("wrong checksum for topic id and msg")
+                    rospy.loginfo("Wrong checksum for topic id and msg. Topic id: %d, name: %s", topic_id, topic_name)
 
             except IOError as exc:
                 rospy.logwarn('Last read step: %s' % read_step)
@@ -572,10 +662,11 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             pub = Publisher(msg)
+            self.topics[msg.topic_id] = msg.topic_name
             self.publishers[msg.topic_id] = pub
             self.callbacks[msg.topic_id] = pub.handlePacket
             self.setPublishSize(msg.buffer_size)
-            rospy.loginfo("Setup publisher on %s [%s]" % (msg.topic_name, msg.message_type) )
+            rospy.loginfo("Setup publisher on topic: %s [id: %d] [type: %s]", msg.topic_name, msg.topic_id, msg.message_type)
         except Exception as e:
             rospy.logerr("Creation of publisher failed: %s", e)
 
@@ -585,10 +676,11 @@ class SerialClient(object):
             msg = TopicInfo()
             msg.deserialize(data)
             if not msg.topic_name in self.subscribers.keys():
+                self.topics[msg.topic_id] = msg.topic_name
                 sub = Subscriber(msg, self)
                 self.subscribers[msg.topic_name] = sub
                 self.setSubscribeSize(msg.buffer_size)
-                rospy.loginfo("Setup subscriber on %s [%s]" % (msg.topic_name, msg.message_type) )
+                rospy.loginfo("Setup subscriber on topic: %s [id: %d] [type: %s]", msg.topic_name, msg.topic_id, msg.message_type)
             elif msg.message_type != self.subscribers[msg.topic_name].message._type:
                 old_message_type = self.subscribers[msg.topic_name].message._type
                 self.subscribers[msg.topic_name].unregister()
@@ -719,6 +811,60 @@ class SerialClient(object):
         data_buffer = StringIO.StringIO()
         resp.serialize(data_buffer)
         self.send(TopicInfo.ID_PARAMETER_REQUEST, data_buffer.getvalue())
+
+    def handleParameterSetRequest(self, serial_data):
+        """ Receive parameters from device. Set them on the parameter server.
+
+        Supports only simple datatypes and arrays of such.
+        """
+        req = PushParamRequest()
+        req.deserialize(serial_data)
+
+        # Interpret the parameter name
+        param_name = req.name
+        if len(req.name) < 1:
+            rospy.logerr("Attempted to set a parameter without a name.")
+            return
+
+        # Interpret the parameter value
+        params = [req.ints, req.floats, req.strings]
+        params = [param for param in params if len(param) > 0]
+
+        if len(params) == 0:
+            rospy.logerr("No parameters available to be set for {}"
+                         .format(req.name))
+            self._send_parameter_push_response(success=False)
+            return
+
+        if len(params) > 1:
+            rospy.logerr("Attempted to set parameters of different types for {}"
+                         .format(req.name))
+            self._send_parameter_push_response(success=False)
+            return
+
+        # Unpack non-list params
+        param = params[0]  # Since it's a one-element list
+        if len(param) == 1:
+            param = param[0]
+
+        try:
+            rospy.set_param(param_name, param)
+        except:
+            rospy.logerr("Error setting paramter : {0} = {1}".format(param_name, param))
+            self._send_parameter_push_response(success=False)
+
+        self._send_parameter_push_response(success=True)
+
+    def _send_parameter_push_response(self, success):
+        if not isinstance(success, bool):
+            rospy.logerr('Attempted to send a non-Bool parameter set response')
+            return
+
+        resp = PushParamResponse()
+        resp.success = success
+        data_buffer = StringIO.StringIO()
+        resp.serialize(data_buffer)
+        self.send(TopicInfo.ID_PARAMETER_PUSH, data_buffer.getvalue())
 
     def handleLoggingRequest(self, data):
         """ Forward logging information from serial device into ROS. """

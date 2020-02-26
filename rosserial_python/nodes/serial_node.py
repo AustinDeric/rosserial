@@ -35,13 +35,15 @@
 
 __author__ = "mferguson@willowgarage.com (Michael Ferguson)"
 
+import sys
+import time
 import rospy
-from rosserial_python import SerialClient, RosSerialServer
-from serial import SerialException
-from time import sleep
+import socket
+import serial
 import multiprocessing
 
-import sys
+from rosserial_python import SerialClient, RosSerialServer, TcpClient
+
 
 if __name__=="__main__":
 
@@ -50,6 +52,7 @@ if __name__=="__main__":
 
     port_name = rospy.get_param('~port','/dev/ttyUSB0')
     baud = int(rospy.get_param('~baud','57600'))
+    tcp_portnum = int(rospy.get_param('~tcp_port', '6000'))
 
     # for systems where pyserial yields errors in the fcntl.ioctl(self.fd, TIOCMBIS, \
     # TIOCM_DTR_str) line, which causes an IOError, when using simulated port
@@ -66,22 +69,24 @@ if __name__=="__main__":
     if len(sys.argv) == 3 :
         tcp_portnum = int(sys.argv[2])
 
-    if port_name == "tcp" :
-        server = RosSerialServer(tcp_portnum, fork_server)
-        rospy.loginfo("Waiting for socket connections on port %d" % tcp_portnum)
-        try:
-            server.listen()
-        except KeyboardInterrupt:
-            rospy.loginfo("got keyboard interrupt")
-        finally:
-            rospy.loginfo("Shutting down")
-            for process in multiprocessing.active_children():
-                rospy.loginfo("Shutting down process %r", process)
-                process.terminate()
-                process.join()
-            rospy.loginfo("All done")
+        while not rospy.is_shutdown():
+            rospy.loginfo("Connecting to %s at port %d" % ('localhost', tcp_portnum) )
+            try:
+                rospy.loginfo("Creating TCP client.")
+                tcp_client = TcpClient('localhost', tcp_portnum)
+                client = SerialClient(tcp_client)
+                client.run()
+            except KeyboardInterrupt:
+                break
+            except socket.error:
+                time.sleep(0.1)
+                continue
+            except OSError:
+                time.sleep(0.1)
+                continue
 
-    else :          # Use serial port
+    # Use Serial Port
+    else:
         while not rospy.is_shutdown():
             rospy.loginfo("Connecting to %s at %d baud" % (port_name,baud) )
             try:
@@ -89,11 +94,11 @@ if __name__=="__main__":
                 client.run()
             except KeyboardInterrupt:
                 break
-            except SerialException:
-                sleep(1.0)
+            except serial.SerialException:
+                time.sleep(0.1)
                 continue
             except OSError:
-                sleep(1.0)
+                time.sleep(0.1)
                 continue
             except:
                 rospy.logwarn("Unexpected Error.%s", sys.exc_info()[0])

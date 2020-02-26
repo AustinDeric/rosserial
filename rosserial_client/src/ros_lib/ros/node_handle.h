@@ -41,6 +41,7 @@
 #include "rosserial_msgs/TopicInfo.h"
 #include "rosserial_msgs/Log.h"
 #include "rosserial_msgs/RequestParam.h"
+#include "rosserial_msgs/PushParam.h"
 
 #include "ros/msg.h"
 
